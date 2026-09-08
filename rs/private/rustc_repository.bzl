@@ -55,19 +55,25 @@ _LINUX_ZLIB = {
     "aarch64": struct(
         libdir = "usr/lib/aarch64-linux-gnu",
         sha256 = "e55ab3b4fb7b6edc4a628e28ec13f8780b08abe427d33ae148f030d8586d0e9a",
-        url = "https://snapshot.ubuntu.com/ubuntu/20260901T000000Z/pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2.2_arm64.deb",
+        urls = [
+            "https://launchpad.net/ubuntu/+archive/primary/+files/zlib1g_1.3.dfsg-3.1ubuntu2.2_arm64.deb",
+            "https://snapshot.ubuntu.com/ubuntu/20260901T000000Z/pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2.2_arm64.deb",
+        ],
     ),
     "x86_64": struct(
         libdir = "usr/lib/x86_64-linux-gnu",
         sha256 = "84b9cf5752b29c9f92c27cd4c4ba9bbcc70b5ccf9b1b515421a28ae23212e273",
-        url = "https://snapshot.ubuntu.com/ubuntu/20260901T000000Z/pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2.2_amd64.deb",
+        urls = [
+            "https://launchpad.net/ubuntu/+archive/primary/+files/zlib1g_1.3.dfsg-3.1ubuntu2.2_amd64.deb",
+            "https://snapshot.ubuntu.com/ubuntu/20260901T000000Z/pool/main/z/zlib/zlib1g_1.3.dfsg-3.1ubuntu2.2_amd64.deb",
+        ],
     ),
 }
 
-def _extract_deb_payload(rctx, url, sha256, output, strip_prefix):
+def _extract_deb_payload(rctx, urls, sha256, output, strip_prefix):
     deb_dir = ".zlib_deb"
     rctx.download_and_extract(
-        url = url,
+        url = urls,
         sha256 = sha256,
         output = deb_dir,
         type = ".deb",
@@ -75,7 +81,7 @@ def _extract_deb_payload(rctx, url, sha256, output, strip_prefix):
 
     data_archive = deb_dir + "/data.tar.zst"
     if not rctx.path(data_archive).exists:
-        fail("expected data.tar.zst in {}".format(url))
+        fail("expected data.tar.zst in %s" % urls)
 
     rctx.extract(data_archive, output = output, stripPrefix = strip_prefix)
     rctx.delete(deb_dir)
@@ -85,7 +91,7 @@ def _add_linux_zlib(rctx, exec_triple):
         return
 
     zlib = _LINUX_ZLIB[exec_triple.arch]
-    _extract_deb_payload(rctx, zlib.url, zlib.sha256, "lib", zlib.libdir)
+    _extract_deb_payload(rctx, zlib.urls, zlib.sha256, "lib", zlib.libdir)
 
 def _symlink_rust_objcopy_shared_libraries(rctx, exec_triple):
     top_level_lib = rctx.path("lib")
