@@ -8,6 +8,7 @@ load(":bpf_linker_repository_test.bzl", "bpf_linker_repository_tests")
 load(":cargo_toml_utils_test.bzl", "cargo_toml_utils_tests")
 load(":cargo_workspace_graph_test.bzl", "cargo_workspace_graph_tests")
 load(":cfg_parser_test.bzl", "cfg_parser_tests")
+load(":crate_metadata_test.bzl", "crate_metadata_tests")
 load(":lint_flags_test.bzl", "lint_flags_tests")
 load(":registry_utils_test.bzl", "registry_utils_tests")
 load(":rust_repository_utils_test.bzl", "rust_repository_utils_tests")
@@ -38,6 +39,8 @@ cargo_toml_utils_tests()
 cargo_workspace_graph_tests()
 
 cfg_parser_tests()
+
+crate_metadata_tests()
 
 lint_flags_tests()
 
@@ -146,6 +149,7 @@ bzl_library(
     deps = [
         ":annotations",
         ":cargo_credentials",
+        ":crate_metadata",
         ":registry_utils",
         ":toml2json",
         "@bazel_tools//tools/build_defs/repo:git_worker.bzl",
@@ -413,6 +417,7 @@ bzl_library(
     deps = [
         ":annotations",
         ":cargo_workspace_graph",
+        ":crate_metadata",
         ":crate_repository",
         ":downloader",
         ":git_crate_metadata_repository",
@@ -421,5 +426,20 @@ bzl_library(
         ":repository_utils",
         ":toml2json",
         "@bazel_skylib//lib:paths",
+    ],
+)
+
+bzl_library(
+    name = "crate_metadata",
+    srcs = ["crate_metadata.bzl"],
+    visibility = ["//rs:__subpackages__"],
+)
+
+bzl_library(
+    name = "crate_metadata_test",
+    srcs = ["crate_metadata_test.bzl"],
+    deps = [
+        ":crate_metadata",
+        "@bazel_skylib//lib:unittest",
     ],
 )

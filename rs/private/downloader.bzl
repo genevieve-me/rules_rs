@@ -1,6 +1,7 @@
 load("@bazel_tools//tools/build_defs/repo:git_worker.bzl", "git_repo")
 load(":annotations.bzl", "annotation_for")
 load(":cargo_credentials.bzl", "registry_auth_headers")
+load(":crate_metadata.bzl", _git_fact_key = "git_fact_key", _registry_fact_key = "registry_fact_key")
 load(":registry_utils.bzl", "CRATES_IO_REGISTRY", "sharded_path")
 load(":toml2json.bzl", "run_toml2json")
 
@@ -52,12 +53,12 @@ def start_github_downloads(
             continue
 
         name = package["name"]
+        version = package["version"]
+        annotation = annotation_for(annotations, name, version, package["hub_name"])
 
-        key = source + "_" + name
+        key = _git_fact_key(source, name, version, annotation, package.get("strip_prefix"))
         if key in existing_facts:
             continue
-
-        annotation = annotation_for(annotations, name, package["version"], package["hub_name"])
         url = _github_source_to_raw_content_base_url(source) + annotation.workspace_cargo_toml
         in_flight_fetch = state.in_flight_git_crate_fetches_by_url.get(url)
         if in_flight_fetch:
@@ -81,6 +82,7 @@ def start_crate_registry_downloads(
         state,
         annotations,
         packages,
+        registry_metadata_prefixes,
         cargo_credentials,
         debug):
     existing_facts = getattr(mctx, "facts", {}) or {}
@@ -97,29 +99,39 @@ def start_crate_registry_downloads(
         version = package["version"]
 
         if source.startswith("sparse+"):
-            key = name + "_" + version
+            key = _registry_fact_key(source, name, version)
             if key in existing_facts:
                 continue
 
-            in_flight_fetch = state.in_flight_registry_fetches_by_crate.get(name)
+            fetch_key = json.encode([source, name])
+            in_flight_fetch = state.in_flight_registry_fetches_by_crate.get(fetch_key)
             if not in_flight_fetch:
                 url = source.removeprefix("sparse+") + sharded_path(name.lower())
+                metadata_path = "%s_%s.jsonl" % (registry_metadata_prefixes[source], name)
                 in_flight_fetch = mctx.download(
                     url,
-                    name + ".jsonl",
+                    metadata_path,
                     headers = registry_auth_headers(cargo_credentials, source),
                     block = False,
                 )
-                state.in_flight_registry_fetches_by_crate[name] = in_flight_fetch
+                state.in_flight_registry_fetches_by_crate[fetch_key] = struct(
+                    path = metadata_path,
+                    token = in_flight_fetch,
+                )
+            else:
+                metadata_path = in_flight_fetch.path
+                in_flight_fetch = in_flight_fetch.token
 
             package["download_token"] = in_flight_fetch
+            package["registry_metadata_path"] = metadata_path
         elif source.startswith("git+"):
             # TODO(zbarsky): Ideally other forges could use the single-file fastpath...
             if source.startswith("git+https://github.com/"):
                 # Github already handled above
                 continue
 
-            key = source + "_" + name
+            annotation = annotation_for(annotations, name, version, package["hub_name"])
+            key = _git_fact_key(source, name, version, annotation, package.get("strip_prefix"))
             if key in existing_facts:
                 continue
 

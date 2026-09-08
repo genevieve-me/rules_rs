@@ -10,6 +10,7 @@ load("//rs/private:lint_flags.bzl", "cargo_toml_lint_flags", "workspace_cargo_to
 load("//rs/private:registry_utils.bzl", "CRATES_IO_REGISTRY", "registry_config_repo_name")
 load("//rs/private:repository_utils.bzl", "render_select")
 load("//rs/private:toml2json.bzl", "run_toml2json")
+load(":crate_metadata.bzl", "git_fact_key", "registry_fact_key")
 
 def _spoke_repo(hub_name, name, version):
     s = "%s__%s-%s" % (hub_name, name, version)
@@ -165,7 +166,7 @@ def generate_hub_and_spokes(
         source = package["source"]
 
         if source.startswith("sparse+"):
-            key = name + "_" + version
+            key = registry_fact_key(source, name, version)
             fact = existing_facts.get(key)
             if fact:
                 facts[key] = fact
@@ -174,7 +175,7 @@ def generate_hub_and_spokes(
                 package["download_token"].wait()
 
                 # TODO(zbarsky): Should we also dedupe this parsing?
-                for line in mctx.read(name + ".jsonl").strip().split("\n"):
+                for line in mctx.read(package["registry_metadata_path"]).strip().split("\n"):
                     if version not in line:
                         continue
                     metadata = json.decode(line)
@@ -226,7 +227,8 @@ def generate_hub_and_spokes(
 
             package["strip_prefix"] = fact.get("strip_prefix", "")
         elif source.startswith("git+"):
-            key = source + "_" + name
+            annotation = annotation_for(annotations, name, version, hub_name)
+            key = git_fact_key(source, name, version, annotation, package.get("strip_prefix"))
             fact = existing_facts.get(key)
             if fact:
                 facts[key] = fact

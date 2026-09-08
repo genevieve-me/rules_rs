@@ -6,6 +6,7 @@ load("@rs_rust_host_tools//:defs.bzl", "RS_HOST_CARGO_LABEL")
 load("//rs/private:annotations.bzl", "annotation_for", "build_annotation_map", "well_known_annotation_snippet_paths")
 load("//rs/private:cargo_credentials.bzl", "load_cargo_credentials")
 load("//rs/private:crate_hub_generation.bzl", _additive_build_file_content = "additive_build_file_content", _external_repo_for_git_source = "external_repo_for_git_source", _generate_hub_and_spokes = "generate_hub_and_spokes", _git_crate_package_path = "git_crate_package_path")
+load("//rs/private:crate_metadata.bzl", "git_fact_key", "registry_metadata_prefixes")
 load("//rs/private:downloader.bzl", "download_metadata_for_git_crates", "new_downloader_state", "parse_git_url", "start_crate_registry_downloads", "start_github_downloads")
 load("//rs/private:git_cargo_workspace_repository.bzl", "git_cargo_workspace_repository")
 load("//rs/private:registry_config_repository.bzl", "registry_config_repository")
@@ -83,6 +84,13 @@ def _crate_impl(mctx):
             # so we want to enqueue them early so they don't get delayed by 1-shot registry downloads.
             start_github_downloads(mctx, downloader_state, annotations, parsed_packages)
 
+    metadata_prefixes = registry_metadata_prefixes({
+        package["source"]: None
+        for packages in packages_by_hub_name.values()
+        for package in packages
+        if package.get("source", "").startswith("sparse+")
+    })
+
     for mod in mctx.modules:
         for cfg in mod.tags.from_cargo:
             annotations = annotations_by_hub_name[cfg.name]
@@ -105,7 +113,7 @@ def _crate_impl(mctx):
                 if package.get("source") and package["source"].startswith("sparse+")
             ])
 
-            start_crate_registry_downloads(mctx, downloader_state, annotations, packages, cargo_credentials, cfg.debug)
+            start_crate_registry_downloads(mctx, downloader_state, annotations, packages, metadata_prefixes, cargo_credentials, cfg.debug)
 
             for source in sorted(registry_sources):
                 registry_config_repository(
@@ -182,7 +190,8 @@ def _crate_impl(mctx):
 
                 strip_prefix = package.get("strip_prefix")
                 if strip_prefix == None:
-                    strip_prefix = json.decode(facts[source + "_" + package["name"]])["strip_prefix"]
+                    key = git_fact_key(source, package["name"], package["version"], annotation, package.get("strip_prefix"))
+                    strip_prefix = json.decode(facts[key])["strip_prefix"]
                 package_path = _git_crate_package_path(annotation, strip_prefix)
                 build_file_path = paths.join(package_path, "BUILD.bazel") if package_path else "BUILD.bazel"
                 git_repo["build_files"][build_file_path] = _additive_build_file_content(mctx, annotation)
