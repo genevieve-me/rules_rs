@@ -405,3 +405,21 @@ bzl_library(
     srcs = ["semver.bzl"],
     visibility = ["//rs:__subpackages__"],
 )
+
+bzl_library(
+    name = "crate_hub_generation",
+    srcs = ["crate_hub_generation.bzl"],
+    visibility = ["//rs:__subpackages__"],
+    deps = [
+        ":annotations",
+        ":cargo_workspace_graph",
+        ":crate_repository",
+        ":downloader",
+        ":git_crate_metadata_repository",
+        ":lint_flags",
+        ":registry_utils",
+        ":repository_utils",
+        ":toml2json",
+        "@bazel_skylib//lib:paths",
+    ],
+)
