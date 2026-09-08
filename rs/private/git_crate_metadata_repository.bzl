@@ -1,4 +1,4 @@
-load(":repository_utils.bzl", "render_rust_crate_call", "rust_crate_attrs")
+load(":repository_utils.bzl", "crate_identity_attr", "render_rust_crate_call", "rust_crate_attrs")
 
 def _git_crate_metadata_repository_implementation(rctx):
     rctx.file("crate.bzl", """\
@@ -49,5 +49,5 @@ git_crate_metadata_repository = repository_rule(
         "package_name": attr.string(mandatory = True),
         "package_version": attr.string(mandatory = True),
         "purl": attr.string(mandatory = True),
-    } | rust_crate_attrs,
+    } | crate_identity_attr | rust_crate_attrs,
 )

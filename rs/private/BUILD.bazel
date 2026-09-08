@@ -417,6 +417,7 @@ bzl_library(
     deps = [
         ":annotations",
         ":cargo_workspace_graph",
+        ":crate_identity",
         ":crate_metadata",
         ":crate_repository",
         ":downloader",
@@ -442,4 +443,11 @@ bzl_library(
         ":crate_metadata",
         "@bazel_skylib//lib:unittest",
     ],
+)
+
+bzl_library(
+    name = "crate_identity",
+    srcs = ["crate_identity.bzl"],
+    visibility = ["//rs:__subpackages__"],
+    deps = [":downloader"],
 )

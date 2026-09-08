@@ -2,7 +2,7 @@ load("@bazel_tools//tools/build_defs/repo:cache.bzl", "get_default_canonical_id"
 load("@bazel_tools//tools/build_defs/repo:utils.bzl", "get_auth", "patch")
 load(":cargo_credentials.bzl", "load_cargo_credentials", "registry_auth_headers")
 load(":registry_utils.bzl", "registry_download_url_from_template")
-load(":repository_utils.bzl", "cargo_build_file_values", "common_attrs", "render_build_file_content")
+load(":repository_utils.bzl", "cargo_build_file_values", "common_attrs", "crate_identity_attr", "render_build_file_content")
 load(":toml2json.bzl", "run_toml2json")
 
 def _cargo_purl(package_name, version, qualifiers = {}):
@@ -76,7 +76,7 @@ crate_repository = repository_rule(
         "checksum": attr.string(),
         "registry_config": attr.label(allow_single_file = True, mandatory = True),
         "sbom_extra_qualifiers": attr.string_dict(),
-    } | common_attrs,
+    } | crate_identity_attr | common_attrs,
 )
 
 def _local_crate_repository_impl(rctx):

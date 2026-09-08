@@ -10,6 +10,7 @@ load("//rs/private:lint_flags.bzl", "cargo_toml_lint_flags", "workspace_cargo_to
 load("//rs/private:registry_utils.bzl", "CRATES_IO_REGISTRY", "registry_config_repo_name")
 load("//rs/private:repository_utils.bzl", "render_select")
 load("//rs/private:toml2json.bzl", "run_toml2json")
+load(":crate_identity.bzl", "crate_identity")
 load(":crate_metadata.bzl", "git_fact_key", "registry_fact_key")
 
 def _spoke_repo(hub_name, name, version):
@@ -377,6 +378,7 @@ crate.annotation(
                 additive_build_file = annotation.additive_build_file,
                 additive_build_file_content = annotation.additive_build_file_content,
                 crate_name = crate_name,
+                crate_identity = crate_identity(package),
                 version = version,
                 registry_config = "@%s//:dl" % registry_config_repo_name(hub_name, source),
                 sbom_extra_qualifiers = qualifiers,
@@ -418,6 +420,7 @@ crate.annotation(
                 continue
 
             git_crate_metadata_repository(
+                crate_identity = crate_identity(package, package_path),
                 name = repo_name,
                 package_name = crate_name,
                 package_version = version,

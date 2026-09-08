@@ -170,7 +170,7 @@ _RUST_CRATE_MACRO_CALL = """{indent}rust_crate(
 {indent}    crate_name = {crate_name},
 {indent}    purl = {purl},
 {indent}    version = {version},
-{indent}    aliases = {{
+{crate_identity_attr}{indent}    aliases = {{
 {indent}        {aliases}
 {indent}    }},
 {indent}    deps = [
@@ -243,6 +243,10 @@ def render_rust_crate_call(attr, values, bazel_metadata = {}, extra_deps = "", i
     rustc_env = cargo_manifest_env | getattr(attr, "rustc_env", {})
     rustc_env_attr = "%s    rustc_env = %s,\n" % (indent, repr(rustc_env)) if rustc_env else ""
     skip_deps_verification_attr = "%s    skip_deps_verification = True,\n" % indent if skip_deps_verification else ""
+    crate_identity = getattr(attr, "crate_identity", "")
+    crate_identity_attr = ""
+    if crate_identity:
+        crate_identity_attr = "%s    crate_identity = %r,\n" % (indent, crate_identity)
 
     return _RUST_CRATE_MACRO_CALL.format(
         indent = indent,
@@ -250,6 +254,7 @@ def render_rust_crate_call(attr, values, bazel_metadata = {}, extra_deps = "", i
         crate_name = values["crate_name"],
         purl = values["purl"],
         version = values["version"],
+        crate_identity_attr = crate_identity_attr,
         aliases = list_indent.join(['"%s": "%s"' % kv for kv in attr.aliases.items()]),
         deps = list_indent.join(['"%s"' % d for d in sorted(deps)]),
         extra_deps = extra_deps,
@@ -382,5 +387,11 @@ common_attrs = rust_crate_attrs | {
         doc = "Sequence of Powershell commands to be applied on Windows after patches are " +
               "applied. If this attribute is not set, patch_cmds will be executed on Windows, " +
               "which requires Bash binary to exist.",
+    ),
+}
+
+crate_identity_attr = {
+    "crate_identity": attr.string(
+        doc = "Reserved `cargo:` logical library identity emitted on generated library targets.",
     ),
 }
