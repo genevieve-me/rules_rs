@@ -1,23 +1,28 @@
-"""Extensions."""
+"""Cargo module extension configuration and orchestration."""
 
 load("@bazel_lib//lib:repo_utils.bzl", "repo_utils")
 load("@bazel_skylib//lib:paths.bzl", "paths")
 load("@rs_rust_host_tools//:defs.bzl", "RS_HOST_CARGO_LABEL")
 load("//rs/private:annotations.bzl", "annotation_for", "build_annotation_map", "well_known_annotation_snippet_paths")
 load("//rs/private:cargo_credentials.bzl", "load_cargo_credentials")
-load("//rs/private:crate_hub_generation.bzl", _additive_build_file_content = "additive_build_file_content", _external_repo_for_git_source = "external_repo_for_git_source", _generate_hub_and_spokes = "generate_hub_and_spokes", _git_crate_package_path = "git_crate_package_path")
-load("//rs/private:crate_metadata.bzl", "git_fact_key", "registry_metadata_prefixes")
-load("//rs/private:downloader.bzl", "download_metadata_for_git_crates", "new_downloader_state", "parse_git_url", "start_crate_registry_downloads", "start_github_downloads")
+load("//rs/private:crate_coalescing.bzl", _finalize_coalescer = "finalize_coalescer")
+load("//rs/private:crate_collection_order.bzl", _coalescer_collection_order = "coalescer_collection_order")
+load("//rs/private:crate_hub_generation.bzl", _additive_build_file_content = "additive_build_file_content", _generate_hub_and_spokes = "generate_hub_and_spokes")
+load("//rs/private:crate_hub_resolution.bzl", _resolve_hub = "resolve_hub")
+load("//rs/private:crate_identity.bzl", _normalize_git_remote = "normalize_git_remote")
+load("//rs/private:crate_metadata.bzl", _add_git_build_file = "add_git_build_file", _add_registry_fetch_config = "add_registry_fetch_config", _git_checkout_fingerprint = "git_checkout_fingerprint", _record_hub_config = "record_hub_config", _registry_metadata_prefixes = "registry_metadata_prefixes", _selected_registry_credentials = "selected_registry_credentials")
+load("//rs/private:downloader.bzl", "download_metadata_for_git_crates", "download_registry_config", "new_downloader_state", "parse_git_url", "start_crate_registry_downloads", "start_github_downloads")
 load("//rs/private:git_cargo_workspace_repository.bzl", "git_cargo_workspace_repository")
-load("//rs/private:registry_config_repository.bzl", "registry_config_repository")
-load("//rs/private:registry_utils.bzl", "registry_config_repo_name", "resolve_registry_source")
+load("//rs/private:registry_utils.bzl", "CRATES_IO_REGISTRY", "resolve_registry_source")
 load("//rs/private:toml2json.bzl", "run_toml2json")
+
+_label_list_dict = getattr(attr, "label_list_dict", attr.string_list_dict)
 
 def _crate_impl(mctx):
     # TODO(zbarsky): Kick off `cargo` fetch early to mitigate https://github.com/bazelbuild/bazel/issues/26995
     cargo_path = mctx.path(RS_HOST_CARGO_LABEL)
 
-    # And toml2json
+    # Force the hermetic toml2json repository to be available before resolution.
     toml2json = mctx.path(Label("@toml2json_%s//file:downloaded" % repo_utils.platform(mctx)))
 
     downloader_state = new_downloader_state()
@@ -41,8 +46,9 @@ def _crate_impl(mctx):
     cargo_toml_by_hub_name = {}
     cargo_config_by_hub_name = {}
     parsed_cargo_configs = {}
-    cargo_credentials_by_hub_name = {}
+    registry_fetch_configs = {}
     annotations_by_hub_name = {}
+    configs_by_hub_name = {}
 
     for mod in mctx.modules:
         if not mod.tags.from_cargo:
@@ -53,6 +59,7 @@ def _crate_impl(mctx):
             fail("`.from_cargo` is required. Please update %s" % mod.name)
 
         for cfg in mod.tags.from_cargo:
+            _record_hub_config(configs_by_hub_name, cfg, mod)
             annotations = build_annotation_map(mod, cfg.name, cfg.platform_triples)
             annotations_by_hub_name[cfg.name] = annotations
             mctx.watch(cfg.cargo_lock)
@@ -84,132 +91,213 @@ def _crate_impl(mctx):
             # so we want to enqueue them early so they don't get delayed by 1-shot registry downloads.
             start_github_downloads(mctx, downloader_state, annotations, parsed_packages)
 
-    metadata_prefixes = registry_metadata_prefixes({
-        package["source"]: None
-        for packages in packages_by_hub_name.values()
-        for package in packages
-        if package.get("source", "").startswith("sparse+")
-    })
+    configs = [configs_by_hub_name[name] for name in sorted(configs_by_hub_name)]
+    for config in configs:
+        cfg = config.cfg
+        effective_cargo_config = cargo_config_by_hub_name[cfg.name]
+        use_home_cargo_credentials = cfg.use_home_cargo_credentials or global_use_home_cargo_credentials
 
-    for mod in mctx.modules:
-        for cfg in mod.tags.from_cargo:
-            annotations = annotations_by_hub_name[cfg.name]
-            effective_cargo_config = cargo_config_by_hub_name[cfg.name]
-            use_home_cargo_credentials = cfg.use_home_cargo_credentials or global_use_home_cargo_credentials
+        if use_home_cargo_credentials:
+            if not effective_cargo_config:
+                fail("Must provide cargo_config or crate.config(cargo_config_toml = ...) when using cargo credentials")
 
-            if use_home_cargo_credentials:
-                if not effective_cargo_config:
-                    fail("Must provide cargo_config or crate.config(cargo_config_toml = ...) when using cargo credentials")
+            cargo_credentials = load_cargo_credentials(mctx, effective_cargo_config)
+        else:
+            cargo_credentials = {}
 
-                cargo_credentials = load_cargo_credentials(mctx, effective_cargo_config)
-            else:
-                cargo_credentials = {}
+        packages = packages_by_hub_name[cfg.name]
+        registry_sources = set()
 
-            cargo_credentials_by_hub_name[cfg.name] = cargo_credentials
-            packages = packages_by_hub_name[cfg.name]
-            registry_sources = set([
-                package["source"]
-                for package in packages
-                if package.get("source") and package["source"].startswith("sparse+")
-            ])
+        for package in packages:
+            source = package.get("source")
+            if source == "registry+https://github.com/rust-lang/crates.io-index":
+                source = CRATES_IO_REGISTRY
+                package["source"] = source
 
-            start_crate_registry_downloads(mctx, downloader_state, annotations, packages, metadata_prefixes, cargo_credentials, cfg.debug)
+            if source and source.startswith("sparse+"):
+                registry_sources.add(source)
 
-            for source in sorted(registry_sources):
-                registry_config_repository(
-                    name = registry_config_repo_name(cfg.name, source),
-                    source = source,
-                    cargo_config = effective_cargo_config,
-                    use_home_cargo_credentials = use_home_cargo_credentials,
-                )
+        for source in sorted(registry_sources):
+            _add_registry_fetch_config(
+                registry_fetch_configs,
+                cfg.name,
+                source,
+                effective_cargo_config,
+                use_home_cargo_credentials,
+                cargo_credentials,
+            )
+
+    registry_metadata_prefixes = _registry_metadata_prefixes(registry_fetch_configs)
+    for index, source in enumerate(sorted(registry_fetch_configs)):
+        fetch_config = registry_fetch_configs[source]
+        fetch_config.update(download_registry_config(
+            mctx,
+            source = source,
+            cargo_credentials = {source: fetch_config["token"]} if fetch_config["token"] else {},
+            output_prefix = "registry_config_%d" % index,
+        ))
+
+    registry_credentials = _selected_registry_credentials(registry_fetch_configs)
+    for config in configs:
+        cfg = config.cfg
+        start_crate_registry_downloads(
+            mctx,
+            downloader_state,
+            build_annotation_map(config.mod, cfg.name, cfg.platform_triples),
+            packages_by_hub_name[cfg.name],
+            registry_metadata_prefixes,
+            registry_credentials,
+            cfg.debug,
+        )
 
     for fetch_state in downloader_state.in_flight_git_crate_fetches_by_url.values():
         fetch_state.download_token.wait()
 
     download_metadata_for_git_crates(mctx, downloader_state, annotations_by_hub_name)
 
+    # Resolve each Cargo graph exactly once. The returned plans retain all
+    # expensive metadata, fact, feature, workspace, and platform resolution.
+    resolved_configs = []
+    for config in configs:
+        cfg = config.cfg
+        plan = _resolve_hub(
+            mctx,
+            cfg.name,
+            build_annotation_map(config.mod, cfg.name, cfg.platform_triples),
+            cargo_path,
+            cfg.cargo_lock,
+            cargo_config_by_hub_name[cfg.name],
+            cargo_toml_by_hub_name[cfg.name],
+            packages_by_hub_name[cfg.name],
+            cfg.platform_triples,
+            cfg.validate_lockfile,
+            cfg.debug,
+            cfg.generate_lint_config,
+            cfg.use_legacy_rules_rust_platforms,
+        )
+        resolved_configs.append({
+            "config": config,
+            "plan": plan,
+        })
+
+    coalescer = {
+        "assignments": {},
+        "identities_by_repo": {},
+        "packages": {},
+    }
+
+    # First classify every occurrence. No repository is created until all
+    # additive feature and dependency inputs have been merged into their final
+    # compatibility classes.
+    for occurrence in _coalescer_collection_order(resolved_configs):
+        _generate_hub_and_spokes(
+            mctx,
+            occurrence["plan"],
+            suggested_annotation_snippet_paths,
+            registry_fetch_configs,
+            coalescer,
+            materialize = False,
+            packages_to_process = [occurrence["package"]],
+        )
+    _finalize_coalescer(coalescer)
+
     facts = {}
+    fact_hubs = {}
     direct_deps = []
     direct_dev_deps = []
+    for resolved in resolved_configs:
+        config = resolved["config"]
+        cfg = config.cfg
+        plan = resolved["plan"]
 
-    for mod in mctx.modules:
-        for cfg in mod.tags.from_cargo:
-            if mod.is_root:
-                if mctx.is_dev_dependency(cfg):
-                    direct_dev_deps.append(cfg.name)
-                else:
-                    direct_deps.append(cfg.name)
+        if config.mod.is_root:
+            if mctx.is_dev_dependency(cfg):
+                direct_dev_deps.append(cfg.name)
+            else:
+                direct_deps.append(cfg.name)
 
-            hub_packages = packages_by_hub_name[cfg.name]
-            effective_cargo_config = cargo_config_by_hub_name[cfg.name]
-            cargo_credentials = cargo_credentials_by_hub_name[cfg.name]
+        for key, value in plan["facts"].items():
+            previous = facts.get(key)
+            if previous != None and previous != value:
+                fail("Conflicting cached Cargo metadata fact %s in hubs %s and %s" % (
+                    key,
+                    fact_hubs[key],
+                    cfg.name,
+                ))
+            if previous == None:
+                fact_hubs[key] = cfg.name
+            facts[key] = value
+        _generate_hub_and_spokes(
+            mctx,
+            plan,
+            suggested_annotation_snippet_paths,
+            registry_fetch_configs,
+            coalescer,
+            materialize = True,
+        )
 
-            annotations = annotations_by_hub_name[cfg.name]
-
-            if cfg.debug:
-                for _ in range(25):
-                    _generate_hub_and_spokes(mctx, cfg.name, annotations, suggested_annotation_snippet_paths, cargo_path, cfg.cargo_lock, cargo_toml_by_hub_name[cfg.name], hub_packages, cfg.platform_triples, cargo_credentials, effective_cargo_config, cfg.validate_lockfile, cfg.debug, cfg.generate_lint_config, cfg.use_legacy_rules_rust_platforms, dry_run = True)
-
-            facts |= _generate_hub_and_spokes(mctx, cfg.name, annotations, suggested_annotation_snippet_paths, cargo_path, cfg.cargo_lock, cargo_toml_by_hub_name[cfg.name], hub_packages, cfg.platform_triples, cargo_credentials, effective_cargo_config, cfg.validate_lockfile, cfg.debug, cfg.generate_lint_config, cfg.use_legacy_rules_rust_platforms)
-
-    # Lay down the git repos with generated per-crate BUILD overlays.
+    # Lay down git source repositories with generated per-crate BUILD overlays.
+    # target_repo_name was assigned explicitly from the compatibility class;
+    # no repository-name-prefix convention is used here.
     git_repos = {}
-    for mod in mctx.modules:
-        for cfg in mod.tags.from_cargo:
-            annotations = annotations_by_hub_name[cfg.name]
-            for package in packages_by_hub_name[cfg.name]:
-                source = package.get("source", "")
-                if not source.startswith("git+"):
-                    continue
+    for resolved in resolved_configs:
+        plan = resolved["plan"]
+        hub_name = plan["hub_name"]
+        annotations = plan["annotations"]
+        for package in plan["packages"]:
+            source = package.get("source", "")
+            if not source.startswith("git+"):
+                continue
 
-                remote, commit = parse_git_url(source)
-                annotation = annotation_for(annotations, package["name"], package["version"], cfg.name)
-                repo_name = _external_repo_for_git_source(cfg.name, remote, commit)
-                git_repo = git_repos.get(repo_name)
-                if not git_repo:
-                    git_repo = {
-                        "build_files": {},
-                        "gen_binaries": {},
-                        "commit": commit,
-                        "hub_name": cfg.name,
-                        "patch_args": [],
-                        "patch_tool": "",
-                        "patches": {},
-                        "remote": remote,
-                        "workspace_cargo_toml": annotation.workspace_cargo_toml,
-                    }
-                    git_repos[repo_name] = git_repo
-                elif git_repo["remote"] != remote or git_repo["commit"] != commit:
-                    fail("Git crates from %s at %s and %s at %s produce the same repository name %s" % (
-                        git_repo["remote"],
-                        git_repo["commit"],
-                        remote,
-                        commit,
-                        repo_name,
-                    ))
+            remote, commit = parse_git_url(source)
+            annotation = annotation_for(annotations, package["name"], package["version"], hub_name)
+            checkout_fingerprint = _git_checkout_fingerprint(annotation)
+            package_path = package["target_package_path"]
+            spoke_repo_name = package["spoke_repo_name"]
+            repo_name = package["target_repo_name"]
 
-                strip_prefix = package.get("strip_prefix")
-                if strip_prefix == None:
-                    key = git_fact_key(source, package["name"], package["version"], annotation, package.get("strip_prefix"))
-                    strip_prefix = json.decode(facts[key])["strip_prefix"]
-                package_path = _git_crate_package_path(annotation, strip_prefix)
-                build_file_path = paths.join(package_path, "BUILD.bazel") if package_path else "BUILD.bazel"
-                git_repo["build_files"][build_file_path] = _additive_build_file_content(mctx, annotation)
-                if annotation.gen_binaries:
-                    git_repo["gen_binaries"][build_file_path] = annotation.gen_binaries
+            git_repo = git_repos.get(repo_name)
+            if not git_repo:
+                git_repo = {
+                    "build_files": {},
+                    "checkout_fingerprint": checkout_fingerprint,
+                    "gen_binaries": {},
+                    "commit": commit,
+                    "first_hub": hub_name,
+                    "patch_args": annotation.patch_args,
+                    "patch_tool": annotation.patch_tool or "",
+                    "patches": annotation.patches,
+                    "remote": remote,
+                    "workspace_cargo_toml": annotation.workspace_cargo_toml,
+                    "crate_bzls": {},
+                }
+                git_repos[repo_name] = git_repo
+            elif _normalize_git_remote(git_repo["remote"]) != _normalize_git_remote(remote) or git_repo["commit"] != commit:
+                fail("Git crates from %s at %s and %s at %s produce the same repository name %s" % (
+                    git_repo["remote"],
+                    git_repo["commit"],
+                    remote,
+                    commit,
+                    repo_name,
+                ))
+            elif git_repo["checkout_fingerprint"] != checkout_fingerprint:
+                fail("Git checkout identity collision for repository %s" % repo_name)
 
-                if annotation.patches:
-                    patch_args = annotation.patch_args
-                    patch_tool = annotation.patch_tool or ""
-                    if git_repo["patches"] and (git_repo["patch_args"] != patch_args or git_repo["patch_tool"] != patch_tool):
-                        fail("Git crates from %s use incompatible patch settings" % source)
+            build_file_path = paths.join(package_path, "BUILD.bazel") if package_path else "BUILD.bazel"
+            additive_build_file_content = _additive_build_file_content(mctx, annotation)
+            _add_git_build_file(
+                git_repo,
+                source,
+                build_file_path,
+                additive_build_file_content,
+                hub_name,
+            )
+            git_repo["crate_bzls"][build_file_path] = "@%s//:crate.bzl" % spoke_repo_name
+            if package["coalesced_gen_binaries"]:
+                git_repo["gen_binaries"][build_file_path] = package["coalesced_gen_binaries"]
 
-                    git_repo["patch_args"] = patch_args
-                    git_repo["patch_tool"] = patch_tool
-                    for patch_file in annotation.patches:
-                        git_repo["patches"][str(patch_file)] = patch_file
-
-    for repo_name, git_repo in git_repos.items():
+    for repo_name in sorted(git_repos):
+        git_repo = git_repos[repo_name]
         kwargs = {}
         if git_repo["gen_binaries"]:
             kwargs["gen_binaries"] = git_repo["gen_binaries"]
@@ -218,10 +306,10 @@ def _crate_impl(mctx):
             name = repo_name,
             build_files = git_repo["build_files"],
             commit = git_repo["commit"],
-            hub_name = git_repo["hub_name"],
+            crate_bzls = git_repo["crate_bzls"],
             patch_args = git_repo["patch_args"],
             patch_tool = git_repo["patch_tool"],
-            patches = git_repo["patches"].values(),
+            patches = git_repo["patches"],
             remote = git_repo["remote"],
             workspace_cargo_toml = git_repo["workspace_cargo_toml"],
             **kwargs
@@ -270,7 +358,7 @@ _from_cargo = tag_class(
             default = False,
         ),
         "use_home_cargo_credentials": attr.bool(
-            doc = "If set, the ruleset will load `~/cargo/credentials.toml` and attach those credentials to registry requests.",
+            doc = "If set, load `$CARGO_HOME/credentials.toml` or `~/.cargo/credentials.toml` and authenticate registry requests whose sparse `config.json` declares `auth-required`.",
         ),
         "platform_triples": attr.string_list(
             mandatory = True,

@@ -40,6 +40,54 @@ def new_downloader_state():
         pending_git_clones_by_source = {},
     )
 
+def download_registry_config(mctx, source, cargo_credentials, output_prefix):
+    """Fetches and parses sparse config.json without preemptive authentication."""
+    url = source.removeprefix("sparse+") + "config.json"
+    anonymous_path = output_prefix + "_anonymous.json"
+    result = mctx.download(
+        url,
+        anonymous_path,
+        allow_fail = True,
+    )
+    config_path = anonymous_path
+    if not result.success:
+        headers = registry_auth_headers(cargo_credentials, source)
+        if not headers:
+            fail("Could not download sparse registry config %s: %s" % (
+                url,
+                getattr(result, "error", "download failed"),
+            ))
+
+        authenticated_path = output_prefix + "_authenticated.json"
+        authenticated_result = mctx.download(
+            url,
+            authenticated_path,
+            allow_fail = True,
+            headers = headers,
+        )
+        if not authenticated_result.success:
+            fail("Could not download sparse registry config %s with configured credentials: %s" % (
+                url,
+                getattr(authenticated_result, "error", "download failed"),
+            ))
+        config_path = authenticated_path
+
+    config = json.decode(mctx.read(config_path))
+    dl = config["dl"]
+    if not (
+        "{crate}" in dl or
+        "{version}" in dl or
+        "{sha256-checksum}" in dl or
+        "{prefix}" in dl or
+        "{lowerprefix}" in dl
+    ):
+        dl += "/{crate}/{version}/download"
+
+    return {
+        "auth_required": config.get("auth-required", False),
+        "dl": dl,
+    }
+
 def start_github_downloads(
         mctx,
         state,

@@ -2,34 +2,49 @@
 
 load("@bazel_skylib//lib:paths.bzl", "paths")
 load("//rs/private:annotations.bzl", "annotation_for")
-load("//rs/private:cargo_workspace_graph.bzl", "cargo_toml_fact", "platform_label", "render_dep_data", "render_string_list", "resolve_cargo_workspace_members", "resolve_package_facts", "split_lockfile_packages", "workspace_dep_data", _fq_crate = "fq_crate", _manifest_package_dir = "manifest_package_dir", _normalize_path = "normalize_path", _select = "select_items")
+load("//rs/private:cargo_workspace_graph.bzl", "platform_label", "render_dep_data", "render_string_list", "workspace_dep_data", _fq_crate = "fq_crate", _manifest_package_dir = "manifest_package_dir", _normalize_path = "normalize_path", _select = "select_items")
+load("//rs/private:crate_coalescing.bzl", _coalesce_spoke = "coalesce_spoke", _coalesced_compilation_fingerprint = "coalesced_compilation_fingerprint", _coalesced_compilation_kwargs = "coalesced_compilation_kwargs")
+load("//rs/private:crate_compatibility.bzl", _compilation_fingerprint = "compilation_fingerprint")
+load("//rs/private:crate_dependency_order.bzl", _hub_dep_fq = "hub_dep_fq")
+load("//rs/private:crate_hub_resolution.bzl", _date = "date")
+load("//rs/private:crate_identity.bzl", _canonical_git_repo = "canonical_git_repo", _crate_identity = "crate_identity", _spoke_repo = "spoke_repo")
+load("//rs/private:crate_metadata.bzl", _git_checkout_fingerprint = "git_checkout_fingerprint")
 load("//rs/private:crate_repository.bzl", "crate_repository", "local_crate_repository")
 load("//rs/private:downloader.bzl", "parse_git_url")
 load("//rs/private:git_crate_metadata_repository.bzl", "git_crate_metadata_repository")
 load("//rs/private:lint_flags.bzl", "cargo_toml_lint_flags", "workspace_cargo_toml_lint_flags")
-load("//rs/private:registry_utils.bzl", "CRATES_IO_REGISTRY", "registry_config_repo_name")
+load("//rs/private:registry_utils.bzl", "CRATES_IO_REGISTRY")
 load("//rs/private:repository_utils.bzl", "render_select")
 load("//rs/private:toml2json.bzl", "run_toml2json")
-load(":crate_identity.bzl", "crate_identity")
-load(":crate_metadata.bzl", "git_fact_key", "registry_fact_key")
 
-def _spoke_repo(hub_name, name, version):
-    s = "%s__%s-%s" % (hub_name, name, version)
-    if "+" in s:
-        s = s.replace("+", "-")
-    return s
+def _canonical_dep_label(label, hub_name, package_by_fq):
+    dep_fq = _hub_dep_fq(label, hub_name)
+    package = package_by_fq.get(dep_fq)
+    if not package:
+        return label
+    return _target_label(
+        package["target_repo_name"],
+        package["target_package_path"],
+        package["name"],
+    )
 
-def _git_repo_remote_name(remote):
-    scheme_separator = remote.find("://")
-    if scheme_separator != -1:
-        remote = remote[scheme_separator + len("://"):]
+def _canonical_dep_select(items, hub_name, package_by_fq):
+    return {
+        triple: [
+            _canonical_dep_label(label, hub_name, package_by_fq)
+            for label in labels
+        ]
+        for triple, labels in items.items()
+    }
 
-    return remote.replace("/", "_").replace(":", "_").replace("@", "_")
+def _canonical_aliases(aliases, hub_name, package_by_fq):
+    return {
+        _canonical_dep_label(label, hub_name, package_by_fq): alias
+        for label, alias in aliases.items()
+    }
 
-def external_repo_for_git_source(hub_name, remote, commit):
-    return hub_name + "__" + _git_repo_remote_name(remote) + "_" + commit[:8]
-
-_external_repo_for_git_source = external_repo_for_git_source
+def _external_repo_for_git_source(hub_name, remote, commit, checkout_fingerprint):
+    return hub_name + "__" + _canonical_git_repo(remote, commit, checkout_fingerprint)
 
 def _git_crate_purl(name, version, remote, commit):
     return "pkg:cargo/%s@%s?vcs_url=git+%s@%s" % (name, version, remote, commit)
@@ -57,18 +72,6 @@ cargo_lints(
         clippy = _render_ordered_string_list(lint_flags.clippy_lint_flags),
         rustdoc = _render_ordered_string_list(lint_flags.rustdoc_lint_flags),
     )
-
-def _date(ctx, label):
-    return
-    result = ctx.execute(["gdate", '+"%Y-%m-%d %H:%M:%S.%3N"'])
-    print(label, result.stdout)
-
-def _label_directory(label):
-    idx = label.name.rfind("/")
-    if idx == -1:
-        return label.package
-
-    return paths.join(label.package, label.name[:idx])
 
 def git_crate_package_path(annotation, strip_prefix):
     workspace_dir = annotation.workspace_cargo_toml.removesuffix("Cargo.toml").removesuffix("/")
@@ -98,203 +101,33 @@ _additive_build_file_content = additive_build_file_content
 
 def generate_hub_and_spokes(
         mctx,
-        hub_name,
-        annotations,
+        plan,
         suggested_annotation_snippet_paths,
-        cargo_path,
-        cargo_lock_path,
-        workspace_cargo_toml_json,
-        all_packages,
-        platform_triples,
-        cargo_credentials,
-        cargo_config,
-        validate_lockfile,
-        debug,
-        generate_lint_config,
-        use_legacy_rules_rust_platforms,
-        dry_run = False):
-    """Generates repositories for the transitive closure of the Cargo workspace.
+        registry_fetch_configs,
+        coalescer,
+        materialize,
+        packages_to_process = None):
+    """Collects spoke classes or materializes a previously resolved hub plan."""
+    hub_name = plan["hub_name"]
+    annotations = plan["annotations"]
+    cargo_lock_path = plan["cargo_lock_path"]
+    cargo_metadata = plan["cargo_metadata"]
+    cfg_match_cache = plan["cfg_match_cache"]
+    feature_resolutions_by_fq_crate = plan["feature_resolutions_by_fq_crate"]
+    package_by_fq = plan["package_by_fq"]
+    packages = plan["packages"] if packages_to_process == None else packages_to_process
+    platform_cfg_attrs = plan["platform_cfg_attrs"]
+    platform_triples = plan["platform_triples"]
+    repo_root = plan["repo_root"]
+    use_legacy_rules_rust_platforms = plan["use_legacy_rules_rust_platforms"]
+    versions_by_name = plan["versions_by_name"]
+    workspace_cargo_toml_json = plan["workspace_cargo_toml_json"]
+    workspace_dep_labels_by_triple = plan["workspace_dep_labels_by_triple"]
+    workspace_dep_versions_by_name = plan["workspace_dep_versions_by_name"]
+    workspace_package = plan["workspace_package"]
 
-    Args:
-        mctx (module_ctx): The module context object.
-        hub_name (string): name
-        annotations (dict): Annotation tags to apply.
-        suggested_annotation_snippet_paths (dict): Mapping crate -> snippet file path.
-        cargo_path (path): Path to hermetic `cargo` binary.
-        cargo_lock_path (path): Cargo.lock path
-        workspace_cargo_toml_json (dict): Parsed workspace Cargo.toml
-        all_packages: list[package]: from cargo lock parsing
-        platform_triples (list[string]): Triples to resolve for
-        cargo_credentials (dict): Mapping of registry to auth token.
-        cargo_config (label): .cargo/config.toml file
-        validate_lockfile (bool): If true, validate we have appropriate versions in Cargo.lock
-        debug (bool): Enable debug logging
-        generate_lint_config (bool): Generate per-package Cargo lint configuration.
-        dry_run (bool): Run all computations but do not create repos. Useful for benchmarking.
-    """
-    _date(mctx, "start")
-
-    mctx.report_progress("Reading workspace metadata")
-    result = mctx.execute(
-        [cargo_path, "metadata", "--no-deps", "--locked", "--format-version=1", "--quiet"] +
-        (["--config", str(mctx.path(cargo_config))] if cargo_config else []),
-        working_directory = str(mctx.path(cargo_lock_path).dirname),
-    )
-    if result.return_code != 0:
-        fail(result.stdout + "\n" + result.stderr)
-    cargo_metadata = json.decode(result.stdout)
-
-    _date(mctx, "parsed cargo metadata")
-
-    existing_facts = getattr(mctx, "facts", {}) or {}
-    facts = {}
-
-    split_packages = split_lockfile_packages(
-        hub_name,
-        cargo_metadata,
-        workspace_cargo_toml_json,
-        all_packages,
-    )
-    packages = split_packages.packages
-    workspace_members = split_packages.workspace_members
-
-    mctx.report_progress("Computing dependencies and features")
-
-    facts_by_fq_crate = {}
-    for package in packages:
-        name = package["name"]
-        version = package["version"]
-        source = package["source"]
-
-        if source.startswith("sparse+"):
-            key = registry_fact_key(source, name, version)
-            fact = existing_facts.get(key)
-            if fact:
-                facts[key] = fact
-                fact = json.decode(fact)
-            else:
-                package["download_token"].wait()
-
-                # TODO(zbarsky): Should we also dedupe this parsing?
-                for line in mctx.read(package["registry_metadata_path"]).strip().split("\n"):
-                    if version not in line:
-                        continue
-                    metadata = json.decode(line)
-                    if metadata["vers"] != version:
-                        continue
-
-                    features = metadata.get("features") or {}
-
-                    # Crates published with newer Cargo populate this field for `resolver = "2"`.
-                    # It can express more nuanced feature dependencies and overrides the keys from legacy features, if present.
-                    features.update(metadata.get("features2") or {})
-
-                    dependencies = metadata["deps"]
-
-                    for dep in dependencies:
-                        if dep["default_features"]:
-                            dep.pop("default_features")
-                        if not dep["features"]:
-                            dep.pop("features")
-                        if dep.get("target", "") == None:
-                            dep.pop("target")
-                        if dep["kind"] == "normal":
-                            dep.pop("kind")
-                        if not dep["optional"]:
-                            dep.pop("optional")
-
-                    fact = dict(
-                        features = features,
-                        dependencies = dependencies,
-                    )
-
-                    # Nest a serialized JSON since max path depth is 5.
-                    facts[key] = json.encode(fact)
-                    break
-
-                if fact == None:
-                    fail("Sparse registry %s has no metadata for %s %s" % (source, name, version))
-        elif source.startswith("path+"):
-            # Always re-read a path dependency's Cargo.toml instead of using cached facts.
-            # Path dependencies are local, and Cargo.toml can change features or
-            # dependencies without changing Cargo.lock, causing stale resolution.
-            # Do not return path dependency facts for storage in MODULE.bazel.lock.
-            # Watch Cargo.toml so Bazel re-runs the extension when Cargo.toml changes.
-            cargo_toml_path = paths.join(package["local_path"], "Cargo.toml")
-            mctx.watch(mctx.path(cargo_toml_path))
-            annotation = annotation_for(annotations, name, package["version"], hub_name)
-            cargo_toml_json = run_toml2json(mctx, cargo_toml_path)
-            fact = cargo_toml_fact(cargo_toml_json, {})
-
-            package["strip_prefix"] = fact.get("strip_prefix", "")
-        elif source.startswith("git+"):
-            annotation = annotation_for(annotations, name, version, hub_name)
-            key = git_fact_key(source, name, version, annotation, package.get("strip_prefix"))
-            fact = existing_facts.get(key)
-            if fact:
-                facts[key] = fact
-                fact = json.decode(fact)
-            else:
-                annotation = annotation_for(annotations, name, package["version"], hub_name)
-                info = package.get("member_crate_cargo_toml_info")
-                if info:
-                    # TODO(zbarsky): These tokens got enqueues last, so this can bottleneck
-                    # We can try a bit harder to interleave things if we care.
-                    info.token.wait()
-                    package_workspace_cargo_toml_json = package["workspace_cargo_toml_json"]
-                    cargo_toml_json = run_toml2json(mctx, info.path)
-                else:
-                    cargo_toml_json = package["cargo_toml_json"]
-                    package_workspace_cargo_toml_json = package.get("workspace_cargo_toml_json")
-                strip_prefix = package.get("strip_prefix", "")
-
-                fact = cargo_toml_fact(cargo_toml_json, package_workspace_cargo_toml_json, strip_prefix = strip_prefix)
-
-                if not fact["dependencies"] and debug:
-                    print(name, version, package["source"])
-
-                # Nest a serialized JSON since max path depth is 5.
-                facts[key] = json.encode(fact)
-
-            package["strip_prefix"] = fact["strip_prefix"]
-        else:
-            fail("Unknown source %s for crate %s" % (source, name))
-
-        facts_by_fq_crate[_fq_crate(name, version)] = fact
-
-    resolved_facts = resolve_package_facts(packages, facts_by_fq_crate, platform_triples)
-    feature_resolutions_by_fq_crate = resolved_facts.feature_resolutions_by_fq_crate
-    versions_by_name = resolved_facts.versions_by_name
-
-    # Only files in the current Bazel workspace can/should be watched, so check where our manifests are located.
-    watch_manifests = cargo_lock_path.repo_name == ""
-
-    workspace_resolution = resolve_cargo_workspace_members(
-        mctx,
-        cargo_metadata = cargo_metadata,
-        packages = packages,
-        workspace_members = workspace_members,
-        versions_by_name = versions_by_name,
-        feature_resolutions_by_fq_crate = feature_resolutions_by_fq_crate,
-        annotations = annotations,
-        platform_triples = platform_triples,
-        materialize_workspace_members = False,
-        validate_lockfile = validate_lockfile,
-        debug = debug,
-        dep_label_prefix = "@%s//:" % hub_name,
-        watch_manifests = watch_manifests,
-        use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
-    )
-    cfg_match_cache = workspace_resolution.cfg_match_cache
-    platform_cfg_attrs = workspace_resolution.platform_cfg_attrs
-    workspace_dep_labels_by_triple = workspace_resolution.workspace_dep_labels_by_triple
-    workspace_dep_versions_by_name = workspace_resolution.workspace_dep_versions_by_name
-
-    _date(mctx, "set up initial deps!")
-
-    mctx.report_progress("Initializing spokes")
-
-    use_home_cargo_credentials = bool(cargo_credentials)
+    if materialize:
+        mctx.report_progress("Initializing spokes for %s" % hub_name)
 
     for package in packages:
         crate_name = package["name"]
@@ -305,7 +138,7 @@ def generate_hub_and_spokes(
 
         annotation = annotation_for(annotations, crate_name, version, hub_name)
         suggested_annotation = None
-        if annotation.gen_build_script == "auto":
+        if materialize and annotation.gen_build_script == "auto":
             snippet_path = suggested_annotation_snippet_paths.get(crate_name)
             if snippet_path:
                 suggested_annotation = mctx.read(snippet_path).strip()
@@ -334,7 +167,11 @@ crate.annotation(
             hub_name = hub_name,
             gen_build_script = annotation.gen_build_script,
             build_script_deps = [],
-            build_script_deps_select = _select(feature_resolutions.build_deps),
+            build_script_deps_select = _canonical_dep_select(
+                _select(feature_resolutions.build_deps),
+                hub_name,
+                package_by_fq,
+            ),
             build_script_data = annotation.build_script_data,
             build_script_data_select = annotation.build_script_data_select,
             build_script_env = annotation.build_script_env,
@@ -351,22 +188,43 @@ crate.annotation(
             data = annotation.data,
             deps = annotation.deps,
             crate_tags = annotation.tags,
-            deps_select = _select(feature_resolutions.deps),
+            deps_select = _canonical_dep_select(
+                _select(feature_resolutions.deps),
+                hub_name,
+                package_by_fq,
+            ),
+            aliases = _canonical_aliases(
+                feature_resolutions.aliases,
+                hub_name,
+                package_by_fq,
+            ),
             link_deps = annotation.link_deps,
-            aliases = feature_resolutions.aliases,
             crate_features = annotation.crate_features,
             crate_features_select = _select(feature_resolutions.features_enabled),
+            platform_triples = platform_triples,
             use_legacy_rules_rust_platforms = use_legacy_rules_rust_platforms,
         )
 
-        repo_name = _spoke_repo(hub_name, crate_name, version)
-        package["target_repo_name"] = repo_name
-        package["target_package_path"] = ""
-
         if source.startswith("sparse+"):
+            fetch_config = registry_fetch_configs[source]
             checksum = package["checksum"]
+            fingerprint = _compilation_fingerprint(package, annotation, kwargs, platform_triples)
+            repo_name, class_index, create_repo = _coalesce_spoke(coalescer, package, "", hub_name, fingerprint)
+            finalized_fingerprint = _coalesced_compilation_fingerprint(
+                coalescer,
+                package,
+                "",
+                hub_name,
+                fingerprint,
+            )
+            kwargs = _coalesced_compilation_kwargs(coalescer, package, "", hub_name, kwargs)
+            crate_identity = _crate_identity(package, "")
+            package["coalesced_gen_binaries"] = finalized_fingerprint["union"]["gen_binaries"]
+            package["spoke_repo_name"] = repo_name
+            package["target_repo_name"] = repo_name
+            package["target_package_path"] = ""
 
-            if dry_run:
+            if not materialize or not create_repo:
                 continue
 
             qualifiers = {}
@@ -378,23 +236,29 @@ crate.annotation(
                 additive_build_file = annotation.additive_build_file,
                 additive_build_file_content = annotation.additive_build_file_content,
                 crate_name = crate_name,
-                crate_identity = crate_identity(package),
                 version = version,
-                registry_config = "@%s//:dl" % registry_config_repo_name(hub_name, source),
+                registry_auth_required = fetch_config["auth_required"],
+                registry_dl = fetch_config["dl"],
                 sbom_extra_qualifiers = qualifiers,
                 checksum = checksum,
-                gen_binaries = annotation.gen_binaries,
+                gen_binaries = finalized_fingerprint["union"]["gen_binaries"],
                 patch_args = annotation.patch_args,
                 patch_tool = annotation.patch_tool,
                 patches = annotation.patches,
                 # The repository will need to recompute these, but this lets us avoid serializing them.
-                use_home_cargo_credentials = use_home_cargo_credentials,
-                cargo_config = cargo_config,
+                use_home_cargo_credentials = fetch_config["use_home_cargo_credentials"],
+                cargo_config = fetch_config["cargo_config"],
                 source = source,
+                crate_identity = crate_identity,
                 **kwargs
             )
         elif source.startswith("path+"):
-            if dry_run:
+            repo_name = _spoke_repo(hub_name, crate_name, version)
+            package["spoke_repo_name"] = repo_name
+            package["target_repo_name"] = repo_name
+            package["target_package_path"] = ""
+
+            if not materialize:
                 continue
 
             # TODO What PURL should that be ?
@@ -411,36 +275,50 @@ crate.annotation(
             )
         elif source.startswith("git+"):
             remote, commit = parse_git_url(source)
+            checkout_fingerprint = _git_checkout_fingerprint(annotation)
 
             package_path = _git_crate_package_path(annotation, package.get("strip_prefix"))
-            package["target_repo_name"] = _external_repo_for_git_source(hub_name, remote, commit)
+            fingerprint = _compilation_fingerprint(package, annotation, kwargs, platform_triples)
+            repo_name, class_index, create_repo = _coalesce_spoke(coalescer, package, package_path, hub_name, fingerprint)
+            finalized_fingerprint = _coalesced_compilation_fingerprint(
+                coalescer,
+                package,
+                package_path,
+                hub_name,
+                fingerprint,
+            )
+            kwargs = _coalesced_compilation_kwargs(coalescer, package, package_path, hub_name, kwargs)
+            crate_identity = _crate_identity(package, package_path)
+            package["coalesced_gen_binaries"] = finalized_fingerprint["union"]["gen_binaries"]
+            package["spoke_repo_name"] = repo_name
+            if class_index == 0:
+                package["target_repo_name"] = _canonical_git_repo(remote, commit, checkout_fingerprint)
+            else:
+                package["target_repo_name"] = _external_repo_for_git_source(repo_name, remote, commit, checkout_fingerprint)
             package["target_package_path"] = package_path
 
-            if dry_run:
+            if not materialize or not create_repo:
                 continue
 
             git_crate_metadata_repository(
-                crate_identity = crate_identity(package, package_path),
                 name = repo_name,
                 package_name = crate_name,
                 package_version = version,
                 purl = _git_crate_purl(crate_name, version, remote, commit),
+                crate_identity = crate_identity,
                 **kwargs
             )
         else:
             fail("Unknown source %s for crate %s" % (source, crate_name))
 
+    if not materialize:
+        return
+
     _date(mctx, "created repos")
 
     mctx.report_progress("Initializing hub")
 
-    package_by_fq = {
-        _fq_crate(package["name"], package["version"]): package
-        for package in packages
-    }
-    repo_root = _normalize_path(cargo_metadata["workspace_root"])
-    workspace_package = _label_directory(cargo_lock_path)
-
+    generate_lint_config = plan["generate_lint_config"]
     workspace_lints_present = generate_lint_config and "lints" in workspace_cargo_toml_json.get("workspace", {})
     workspace_manifest_path = paths.join(repo_root, "Cargo.toml")
     lint_configs = {}
@@ -469,7 +347,6 @@ crate.annotation(
                     target_name,
                     cargo_toml_lint_flags(cargo_toml_json),
                 ))
-
     hub_contents = []
     for name, versions in versions_by_name.items():
         for version in versions:
@@ -678,9 +555,6 @@ RESOLVED_PLATFORMS = select({{
         lint_configs = lint_configs,
     ))
 
-    if dry_run:
-        return
-
     _hub_repo(
         name = hub_name,
         contents = {
@@ -690,7 +564,7 @@ RESOLVED_PLATFORMS = select({{
         },
     )
 
-    return facts
+    return plan["facts"]
 
 _generate_hub_and_spokes = generate_hub_and_spokes
 
